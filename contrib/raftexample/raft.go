@@ -17,7 +17,10 @@ package main
 import (
 	"context"
 	"crypto/md5"
+	"encoding/json"
 	"fmt"
+	"github.com/pkg/errors"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
@@ -39,24 +42,26 @@ import (
 )
 
 type Peer struct {
-	id   uint
-	addr string
+	ID   uint64 `json:"id"`
+	Addr string `json:"addr"`
+}
+
+func (p Peer) String() string {
+	return fmt.Sprintf("ID: %d Addr: %s", p.ID, p.Addr)
 }
 
 // A key-value stream backed by raft
 type raftNode struct {
-	proposeC    <-chan string            // proposed messages (k,v)
-	confChangeC <-chan raftpb.ConfChange // proposed cluster config changes
-	commitC     chan<- *string           // entries committed to log (k,v)
-	errorC      chan<- error             // errors from raft session
+	proposeC    <-chan string          // proposed messages (k,v)
+	confChangeC chan raftpb.ConfChange // proposed cluster config changes
+	commitC     chan<- *string         // entries committed to log (k,v)
+	errorC      chan<- error           // errors from raft session
 
-	id          int      // client ID for raft session
-	peer        string   // client ID for raft session
-	ids         []int    // client ID for raft session
-	peers       []string // raft peer URLs
-	join        bool     // node is joining an existing cluster
-	waldir      string   // path to WAL directory
-	snapdir     string   // path to snapshot directory
+	peer        Peer   // client ID for raft session
+	peers       []Peer // raft peer URLs
+	join        bool   // node is joining an existing cluster
+	waldir      string // path to WAL directory
+	snapdir     string // path to snapshot directory
 	getSnapshot func() ([]byte, error)
 
 	confState     raftpb.ConfState
@@ -85,16 +90,14 @@ var defaultSnapshotCount uint64 = 10
 // provided the proposal channel. All log entries are replayed over the
 // commit channel, followed by a nil message (to indicate the channel is
 // current), then new log entries. To shutdown, close proposeC and read errorC.
-func newRaftNode(id int, ids []int, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
-	confChangeC <-chan raftpb.ConfChange) (<-chan *string, <-chan error, <-chan *snap.Snapshotter) {
+func newRaftNode(peer Peer, peers []Peer, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
+	confChangeC chan raftpb.ConfChange) (*raftNode, <-chan *string, <-chan error, <-chan *snap.Snapshotter) {
 
 	commitC := make(chan *string)
 	errorC := make(chan error)
 
-	peer := getPeer(id, ids, peers)
-
 	hash := md5.New()
-	hash.Write([]byte(peer))
+	hash.Write([]byte(peer.Addr))
 	peerHash := fmt.Sprintf("%x", hash.Sum(nil))
 
 	rc := &raftNode{
@@ -102,9 +105,7 @@ func newRaftNode(id int, ids []int, peers []string, join bool, getSnapshot func(
 		confChangeC: confChangeC,
 		commitC:     commitC,
 		errorC:      errorC,
-		id:          id,
-		peer:        getPeer(id, ids, peers),
-		ids:         ids,
+		peer:        peer,
 		peers:       peers,
 		join:        join,
 		waldir:      fmt.Sprintf("raftexample-%s", peerHash),
@@ -118,19 +119,21 @@ func newRaftNode(id int, ids []int, peers []string, join bool, getSnapshot func(
 		snapshotterReady: make(chan *snap.Snapshotter, 1),
 		// rest of structure populated after WAL replay
 	}
-	go rc.startRaft()
-	return commitC, errorC, rc.snapshotterReady
-}
 
-func getPeer(id int, ids []int, peers []string) string {
-	index := 0
-	for i, target := range ids {
-		if id == target {
-			index = i
-			break
+	if recordPeers, err := rc.getRecordPeers(); err != nil {
+		log.Fatalln("parse peers from file error")
+	} else {
+		if len(recordPeers) > 0 {
+			rc.peers = recordPeers
 		}
 	}
-	return peers[index]
+
+	oldwal := wal.Exist(rc.waldir)
+	// all new node should wait call API to start raft
+	if oldwal || peer.ID == uint64(100) { // temp hard code
+		go rc.startRaft()
+	}
+	return rc, commitC, errorC, rc.snapshotterReady
 }
 
 func (rc *raftNode) saveSnap(snap raftpb.Snapshot) error {
@@ -184,19 +187,37 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 		case raftpb.EntryConfChange:
 			var cc raftpb.ConfChange
 			cc.Unmarshal(ents[i].Data)
-			log.Printf("apply conf %v \n", cc)
+			log.Printf("apply conf context %v \n", string(cc.Context))
 			rc.confState = *rc.node.ApplyConfChange(cc)
 			switch cc.Type {
 			case raftpb.ConfChangeAddNode:
 				if len(cc.Context) > 0 {
 					rc.transport.AddPeer(types.ID(cc.NodeID), []string{string(cc.Context)})
 				}
+				// append peer
+				exist := false
+				for _, peer := range rc.peers {
+					if peer.ID == cc.NodeID {
+						exist = true
+						break
+					}
+				}
+				if !exist {
+					rc.peers = append(rc.peers, Peer{ID: cc.NodeID, Addr: string(cc.Context)})
+				}
 			case raftpb.ConfChangeRemoveNode:
-				if cc.NodeID == uint64(rc.id) {
-					log.Println("I've been removed from the cluster! Shutting down.")
-					return false
+				if cc.NodeID == uint64(rc.peer.ID) {
+					log.Println("I've been removed from the cluster! You can shut down.")
 				}
 				rc.transport.RemovePeer(types.ID(cc.NodeID))
+				// remove peer
+				newPeers := make([]Peer, 0)
+				for _, peer := range rc.peers {
+					if peer.ID != cc.NodeID {
+						newPeers = append(newPeers, peer)
+					}
+				}
+				rc.peers = newPeers
 			}
 		}
 
@@ -243,7 +264,7 @@ func (rc *raftNode) openWAL(snapshot *raftpb.Snapshot) *wal.WAL {
 
 // replayWAL replays WAL entries into the raft instance.
 func (rc *raftNode) replayWAL() *wal.WAL {
-	log.Printf("replaying WAL of member %d", rc.id)
+	log.Printf("replaying WAL of member %d", rc.peer.ID)
 	snapshot := rc.loadSnapshot()
 	w := rc.openWAL(snapshot)
 	_, st, ents, err := w.ReadAll()
@@ -271,7 +292,20 @@ func (rc *raftNode) writeError(err error) {
 	rc.node.Stop()
 }
 
+func (rc *raftNode) StartRaftBySpecialPeers(ctx context.Context, peers []Peer, peer Peer) error {
+	if len(peers) == 0 {
+		return errors.New("peers can not be 0")
+	}
+	rc.peers = peers
+	rc.join = true
+	rc.peer = peer
+	rc.startRaft()
+	return nil
+}
+
 func (rc *raftNode) startRaft() {
+
+
 	if !fileutil.Exist(rc.snapdir) {
 		if err := os.Mkdir(rc.snapdir, 0750); err != nil {
 			log.Fatalf("raftexample: cannot create dir for snapshot (%v)", err)
@@ -283,12 +317,15 @@ func (rc *raftNode) startRaft() {
 	oldwal := wal.Exist(rc.waldir)
 	rc.wal = rc.replayWAL()
 
+	// store the init peers to file
+	rc.recordPeers(rc.peers)
+
 	rpeers := make([]raft.Peer, len(rc.peers))
 	for i := range rpeers {
-		rpeers[i] = raft.Peer{ID: uint64(rc.ids[i])}
+		rpeers[i] = raft.Peer{ID: rc.peers[i].ID}
 	}
 	c := &raft.Config{
-		ID:                        uint64(rc.id),
+		ID:                        rc.peer.ID,
 		ElectionTick:              10,
 		HeartbeatTick:             1,
 		Storage:                   rc.raftStorage,
@@ -306,21 +343,20 @@ func (rc *raftNode) startRaft() {
 		}
 		rc.node = raft.StartNode(c, startPeers)
 	}
-
 	rc.transport = &rafthttp.Transport{
 		Logger:      zap.NewExample(),
-		ID:          types.ID(rc.id),
+		ID:          types.ID(rc.peer.ID),
 		ClusterID:   0x1000,
 		Raft:        rc,
 		ServerStats: stats.NewServerStats("", ""),
-		LeaderStats: stats.NewLeaderStats(strconv.Itoa(rc.id)),
+		LeaderStats: stats.NewLeaderStats(strconv.FormatUint(rc.peer.ID, 10)),
 		ErrorC:      make(chan error),
 	}
 
 	rc.transport.Start()
 	for i := range rc.peers {
-		if rc.ids[i] != rc.id {
-			rc.transport.AddPeer(types.ID(rc.ids[i]), []string{rc.peers[i]})
+		if rc.peers[i].ID != rc.peer.ID {
+			rc.transport.AddPeer(types.ID(rc.peers[i].ID), []string{rc.peers[i].Addr})
 		}
 	}
 
@@ -331,7 +367,7 @@ func (rc *raftNode) startRaft() {
 
 func (rc *raftNode) reportStatus() {
 	for range time.NewTicker(time.Second * 5).C {
-		log.Printf("id=%d applied=%d status=%s lead=%d \n", rc.node.Status().ID, rc.node.Status().Applied, rc.node.Status().RaftState, rc.node.Status().Lead)
+		log.Printf("ID=%d applied=%d status=%s lead=%d peers_size=%d peers=%v \n", rc.node.Status().ID, rc.node.Status().Applied, rc.node.Status().RaftState.String(), rc.node.Status().Lead, len(rc.peers), rc.peers)
 	}
 }
 
@@ -480,7 +516,7 @@ func (rc *raftNode) serveChannels() {
 }
 
 func (rc *raftNode) serveRaft() {
-	url, err := url.Parse(rc.peer)
+	url, err := url.Parse(rc.peer.Addr)
 	if err != nil {
 		log.Fatalf("raftexample: Failed parsing URL (%v)", err)
 	}
@@ -505,3 +541,88 @@ func (rc *raftNode) Process(ctx context.Context, m raftpb.Message) error {
 func (rc *raftNode) IsIDRemoved(id uint64) bool                           { return false }
 func (rc *raftNode) ReportUnreachable(id uint64)                          {}
 func (rc *raftNode) ReportSnapshot(id uint64, status raft.SnapshotStatus) {}
+
+func (rc *raftNode) UpdatePeers(ctx context.Context, peers *[]Peer) error {
+	if raft.StateLeader != rc.node.Status().RaftState {
+		return errors.New("this node is not leader")
+	}
+	if peers == nil {
+		return nil
+	}
+	log.Printf("update new peers %v \n", peers)
+	// remove does not exist peers
+	oldPeers := rc.peers
+	for _, oldPeer := range oldPeers {
+		exist := false
+		for _, peer := range *peers {
+			if oldPeer.ID == peer.ID {
+				exist = true
+				break
+			}
+		}
+		if exist {
+			continue
+		}
+		log.Printf("update peers to remove node %d \n", oldPeer.ID)
+		cc := raftpb.ConfChange{
+			Type:   raftpb.ConfChangeRemoveNode,
+			NodeID: oldPeer.ID,
+		}
+		rc.confChangeC <- cc
+	}
+	// add new peers
+	for _, newPeer := range *peers {
+		exist := false
+		for _, oldPeer := range oldPeers {
+			if oldPeer.ID == newPeer.ID {
+				exist = true
+				break
+			}
+		}
+		if exist {
+			continue
+		}
+		log.Printf("update peers to add node %d \n", newPeer.ID)
+		cc := raftpb.ConfChange{
+			Type:    raftpb.ConfChangeAddNode,
+			NodeID:  newPeer.ID,
+			Context: []byte(newPeer.Addr),
+		}
+		rc.confChangeC <- cc
+	}
+	return nil
+}
+
+
+func (rc *raftNode) recordPeers(peers []Peer) error {
+	oldwal := wal.Exist(rc.waldir)
+	if !oldwal {
+		if err := os.Mkdir(rc.waldir, 0750); err != nil {
+			log.Fatalf("raftexample: cannot create dir for wal (%v)", err)
+			return err
+		}
+	}
+	data, err := json.Marshal(peers)
+	if err != nil {
+		return err
+	}
+	err = ioutil.WriteFile(fmt.Sprintf("%s/%s", rc.waldir, "peers.json"), data, 0750)
+	return err
+}
+
+
+func (rc *raftNode) getRecordPeers() ([]Peer, error) {
+	oldwal := wal.Exist(rc.waldir)
+	if !oldwal {
+		return []Peer{}, nil
+	}
+	data, err := ioutil.ReadFile(fmt.Sprintf("%s/%s", rc.waldir, "peers.json"))
+	if err != nil {
+		return nil, err
+	}
+	peers := new([]Peer)
+	if err := json.Unmarshal(data, peers); err != nil {
+		return nil, err
+	}
+	return *peers, nil
+}
