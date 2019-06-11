@@ -78,6 +78,8 @@ func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
 			continue
 		}
 
+		log.Printf("read commit data %s \n", *data)
+
 		var dataKv kv
 		dec := gob.NewDecoder(bytes.NewBufferString(*data))
 		if err := dec.Decode(&dataKv); err != nil {

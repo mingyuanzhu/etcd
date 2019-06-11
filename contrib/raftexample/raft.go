@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
 	"fmt"
 	"log"
 	"net/http"
@@ -37,6 +38,11 @@ import (
 	"go.uber.org/zap"
 )
 
+type Peer struct {
+	id   uint
+	addr string
+}
+
 // A key-value stream backed by raft
 type raftNode struct {
 	proposeC    <-chan string            // proposed messages (k,v)
@@ -45,7 +51,8 @@ type raftNode struct {
 	errorC      chan<- error             // errors from raft session
 
 	id          int      // client ID for raft session
-	ids         []int      // client ID for raft session
+	peer        string   // client ID for raft session
+	ids         []int    // client ID for raft session
 	peers       []string // raft peer URLs
 	join        bool     // node is joining an existing cluster
 	waldir      string   // path to WAL directory
@@ -84,17 +91,24 @@ func newRaftNode(id int, ids []int, peers []string, join bool, getSnapshot func(
 	commitC := make(chan *string)
 	errorC := make(chan error)
 
+	peer := getPeer(id, ids, peers)
+
+	hash := md5.New()
+	hash.Write([]byte(peer))
+	peerHash := fmt.Sprintf("%x", hash.Sum(nil))
+
 	rc := &raftNode{
 		proposeC:    proposeC,
 		confChangeC: confChangeC,
 		commitC:     commitC,
 		errorC:      errorC,
 		id:          id,
+		peer:        getPeer(id, ids, peers),
 		ids:         ids,
 		peers:       peers,
 		join:        join,
-		waldir:      fmt.Sprintf("raftexample-%d", id),
-		snapdir:     fmt.Sprintf("raftexample-%d-snap", id),
+		waldir:      fmt.Sprintf("raftexample-%s", peerHash),
+		snapdir:     fmt.Sprintf("raftexample-%s-snap", peerHash),
 		getSnapshot: getSnapshot,
 		snapCount:   defaultSnapshotCount,
 		stopc:       make(chan struct{}),
@@ -106,6 +120,17 @@ func newRaftNode(id int, ids []int, peers []string, join bool, getSnapshot func(
 	}
 	go rc.startRaft()
 	return commitC, errorC, rc.snapshotterReady
+}
+
+func getPeer(id int, ids []int, peers []string) string {
+	index := 0
+	for i, target := range ids {
+		if id == target {
+			index = i
+			break
+		}
+	}
+	return peers[index]
 }
 
 func (rc *raftNode) saveSnap(snap raftpb.Snapshot) error {
@@ -159,6 +184,7 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 		case raftpb.EntryConfChange:
 			var cc raftpb.ConfChange
 			cc.Unmarshal(ents[i].Data)
+			log.Printf("apply conf %v \n", cc)
 			rc.confState = *rc.node.ApplyConfChange(cc)
 			switch cc.Type {
 			case raftpb.ConfChangeAddNode:
@@ -298,8 +324,15 @@ func (rc *raftNode) startRaft() {
 		}
 	}
 
+	go rc.reportStatus()
 	go rc.serveRaft()
 	go rc.serveChannels()
+}
+
+func (rc *raftNode) reportStatus() {
+	for range time.NewTicker(time.Second * 5).C {
+		log.Printf("id=%d applied=%d status=%s lead=%d \n", rc.node.Status().ID, rc.node.Status().Applied, rc.node.Status().RaftState, rc.node.Status().Lead)
+	}
 }
 
 // stop closes http, closes all channels, and stops raft.
@@ -447,14 +480,7 @@ func (rc *raftNode) serveChannels() {
 }
 
 func (rc *raftNode) serveRaft() {
-	index := 0
-	for i, id := range rc.ids {
-		if id == rc.id {
-			index = i
-			break
-		}
-	}
-	url, err := url.Parse(rc.peers[index])
+	url, err := url.Parse(rc.peer)
 	if err != nil {
 		log.Fatalf("raftexample: Failed parsing URL (%v)", err)
 	}
