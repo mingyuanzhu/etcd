@@ -45,6 +45,7 @@ type raftNode struct {
 	errorC      chan<- error             // errors from raft session
 
 	id          int      // client ID for raft session
+	ids         []int      // client ID for raft session
 	peers       []string // raft peer URLs
 	join        bool     // node is joining an existing cluster
 	waldir      string   // path to WAL directory
@@ -77,7 +78,7 @@ var defaultSnapshotCount uint64 = 10
 // provided the proposal channel. All log entries are replayed over the
 // commit channel, followed by a nil message (to indicate the channel is
 // current), then new log entries. To shutdown, close proposeC and read errorC.
-func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
+func newRaftNode(id int, ids []int, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
 	confChangeC <-chan raftpb.ConfChange) (<-chan *string, <-chan error, <-chan *snap.Snapshotter) {
 
 	commitC := make(chan *string)
@@ -89,6 +90,7 @@ func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, 
 		commitC:     commitC,
 		errorC:      errorC,
 		id:          id,
+		ids:         ids,
 		peers:       peers,
 		join:        join,
 		waldir:      fmt.Sprintf("raftexample-%d", id),
@@ -257,7 +259,7 @@ func (rc *raftNode) startRaft() {
 
 	rpeers := make([]raft.Peer, len(rc.peers))
 	for i := range rpeers {
-		rpeers[i] = raft.Peer{ID: uint64(i + 1)}
+		rpeers[i] = raft.Peer{ID: uint64(rc.ids[i])}
 	}
 	c := &raft.Config{
 		ID:                        uint64(rc.id),
@@ -291,8 +293,8 @@ func (rc *raftNode) startRaft() {
 
 	rc.transport.Start()
 	for i := range rc.peers {
-		if i+1 != rc.id {
-			rc.transport.AddPeer(types.ID(i+1), []string{rc.peers[i]})
+		if rc.ids[i] != rc.id {
+			rc.transport.AddPeer(types.ID(rc.ids[i]), []string{rc.peers[i]})
 		}
 	}
 
@@ -445,7 +447,14 @@ func (rc *raftNode) serveChannels() {
 }
 
 func (rc *raftNode) serveRaft() {
-	url, err := url.Parse(rc.peers[rc.id-1])
+	index := 0
+	for i, id := range rc.ids {
+		if id == rc.id {
+			index = i
+			break
+		}
+	}
+	url, err := url.Parse(rc.peers[index])
 	if err != nil {
 		log.Fatalf("raftexample: Failed parsing URL (%v)", err)
 	}
