@@ -132,6 +132,16 @@ func serveMembersHttpKVAPI(router *mux.Router, port int, confChangeC chan<- raft
 		w.WriteHeader(http.StatusNoContent)
 	}).Methods(http.MethodPost)
 
+	router.HandleFunc("/members/snapshots", func(w http.ResponseWriter, r *http.Request) {
+		err := rc.makeSnapshot(context.TODO())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		// As above, optimistic that raft will apply the conf change
+		w.WriteHeader(http.StatusNoContent)
+	}).Methods(http.MethodPost)
+
 	router.HandleFunc("/members", func(w http.ResponseWriter, r *http.Request) {
 		decoder := json.NewDecoder(r.Body)
 		param := new(StartRaftParam)

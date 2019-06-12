@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"testing"
 )
 
@@ -17,4 +18,12 @@ func TestDecodePeer(t *testing.T) {
 		t.Fatal((*peers)[0].ID)
 	}
 	fmt.Println(peers)
+}
+
+func TestURLParse(t *testing.T) {
+	if url, err := url.Parse("google.com"); err != nil {
+		t.Error(err)
+	} else {
+		fmt.Println("host ", url.Host)
+	}
 }

@@ -73,6 +73,7 @@ type raftNode struct {
 
 	// raft backing for the commit/error channel
 	node        raft.Node
+	// TODO: raft entry will use so many memory until make snapshot will release the memory
 	raftStorage *raft.MemoryStorage
 	wal         *wal.WAL
 
@@ -88,7 +89,7 @@ type raftNode struct {
 	wait wait.Wait
 }
 
-var defaultSnapshotCount uint64 = 10000
+var defaultSnapshotCount uint64 = 100
 
 // newRaftNode initiates a raft instance and returns a committed log entry
 // channel and error channel. Proposals for log updates are sent over the
@@ -283,6 +284,7 @@ func (rc *raftNode) replayWAL() *wal.WAL {
 		log.Fatalf("raftexample: failed to read WAL (%v)", err)
 	}
 	rc.raftStorage = raft.NewMemoryStorage()
+	// TODO : can do something to update the confState peers
 	if snapshot != nil {
 		rc.raftStorage.ApplySnapshot(*snapshot)
 	}
@@ -413,39 +415,16 @@ func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
 	rc.commitC <- nil // trigger kvstore to load snapshot
 }
 
-var snapshotCatchUpEntriesN uint64 = 10000
+var snapshotCatchUpEntriesN uint64 = 100
 
 func (rc *raftNode) maybeTriggerSnapshot() {
-	if rc.getSnapshot == nil {
-		return
-	}
 	if rc.appliedIndex-rc.snapshotIndex <= rc.snapCount {
 		return
 	}
 
-	log.Printf("start snapshot [applied index: %d | last snapshot index: %d]", rc.appliedIndex, rc.snapshotIndex)
-	data, err := rc.getSnapshot()
-	if err != nil {
-		log.Panic(err)
+	if err := rc.makeSnapshot(context.TODO()); err != nil {
+		log.Println("make snapshot err", err)
 	}
-	snap, err := rc.raftStorage.CreateSnapshot(rc.appliedIndex-1, &rc.confState, data)
-	if err != nil {
-		panic(err)
-	}
-	if err := rc.saveSnap(snap); err != nil {
-		panic(err)
-	}
-
-	compactIndex := uint64(1)
-	if rc.appliedIndex > snapshotCatchUpEntriesN {
-		compactIndex = rc.appliedIndex - snapshotCatchUpEntriesN
-	}
-	if err := rc.raftStorage.Compact(compactIndex); err != nil {
-		panic(err)
-	}
-
-	log.Printf("compacted log at index %d", compactIndex)
-	rc.snapshotIndex = rc.appliedIndex
 }
 
 func (rc *raftNode) serveChannels() {
@@ -519,7 +498,7 @@ func (rc *raftNode) serveChannels() {
 				rc.stop()
 				return
 			}
-			rc.maybeTriggerSnapshot()
+			//rc.maybeTriggerSnapshot()
 			rc.node.Advance()
 
 		case err := <-rc.transport.ErrorC:
@@ -641,4 +620,30 @@ func (rc *raftNode) getRecordPeers() ([]Peer, error) {
 		return nil, err
 	}
 	return *peers, nil
+}
+
+func (rc *raftNode) makeSnapshot(ctx context.Context) error {
+	if rc.getSnapshot == nil {
+		return errors.New("make snapshot method empty")
+	}
+	currentIndex := rc.appliedIndex
+	log.Printf("start snapshot [applied index: %d | last snapshot index: %d]", currentIndex, rc.snapshotIndex)
+	data, err := rc.getSnapshot()
+	if err != nil {
+		log.Panic(err)
+	}
+	snap, err := rc.raftStorage.CreateSnapshot(currentIndex-1, &rc.confState, data)
+	if err != nil {
+		return err
+	}
+	rc.recordPeers(rc.peers)
+	if err := rc.saveSnap(snap); err != nil {
+		return err
+	}
+	if err := rc.raftStorage.Compact(currentIndex- 1); err != nil {
+		log.Println("compacted log err", err)
+	}
+	log.Printf("compacted log at index %d", currentIndex - 1)
+	rc.snapshotIndex = currentIndex
+	return nil
 }
