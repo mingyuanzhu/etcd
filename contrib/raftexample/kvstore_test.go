@@ -15,8 +15,13 @@
 package main
 
 import (
+	"bytes"
+	"encoding/gob"
+	"fmt"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 )
 
 func Test_kvstore_snapshot(t *testing.T) {
@@ -44,4 +49,70 @@ func Test_kvstore_snapshot(t *testing.T) {
 	if !reflect.DeepEqual(s.kvStore, tm) {
 		t.Fatalf("store expected %+v, got %+v", tm, s.kvStore)
 	}
+}
+
+func BenchmarkIDWork(b *testing.B) {
+	worker := NewIDWorker()
+	for i := 0; i < b.N; i++ {
+		worker.getID()
+	}
+}
+
+func TestNewIDWorker(t *testing.T) {
+	worker := NewIDWorker()
+	for i := 0; i < 10; i++ {
+		id := worker.getID()
+		if uint64(i+1) != id {
+			t.Fatalf("except %d actual %d", i+1, id)
+		}
+	}
+}
+
+func BenchmarkEncode(b *testing.B) {
+	req := new(Request)
+	req.Data = []kv{{
+		Key: "k_10_10",
+		Val: "v_10_10",
+	}}
+	req.Id = 1
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(req); err != nil {
+		b.Fatal(err)
+	} else {
+		buf.Bytes()
+	}
+}
+
+func BenchmarkDecode(b *testing.B) {
+	req := new(Request)
+	req.Data = []kv{{
+		Key: "k_10_10",
+		Val: "v_10_10",
+	}}
+	req.Id = 1
+	var buf bytes.Buffer
+	err := gob.NewEncoder(&buf).Encode(req)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	for i := 0; i < 1; i++ {
+		var req *Request
+		dec := gob.NewDecoder(bytes.NewBuffer(buf.Bytes()))
+		if err := dec.Decode(&req); err != nil {
+			b.Fatal("raftexample: could not decode message, ", err)
+		}
+	}
+}
+
+func TestPutKey(t *testing.T) {
+	mu := new(sync.RWMutex)
+	m := make(map[string]string)
+	startTime := time.Now().Unix()
+	for i := 0; i < 10000; i++ {
+		mu.Lock()
+		m[fmt.Sprintf("key_%d", i)] = fmt.Sprintf("value_%d", i)
+		mu.Unlock()
+	}
+	fmt.Println("put key elapse ", time.Now().Unix()-startTime)
 }

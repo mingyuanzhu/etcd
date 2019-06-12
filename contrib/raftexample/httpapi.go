@@ -17,12 +17,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/gorilla/mux"
 	"go.etcd.io/etcd/raft/raftpb"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 // Handler for a http based key-value store backed by raft
@@ -32,120 +34,57 @@ type httpKVAPI struct {
 	raftNode    *raftNode
 }
 
-func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	key := r.RequestURI
-	defer r.Body.Close()
-
-	switch {
-	case r.Method == "PUT":
-		v, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			log.Printf("Failed to read on PUT (%v)\n", err)
-			http.Error(w, "Failed on PUT", http.StatusBadRequest)
-			return
-		}
-
-		h.store.Propose(key, string(v))
-
-		// Optimistic-- no waiting for ack from raft. Value is not yet
-		// committed so a subsequent GET on the key may return old value
-		w.WriteHeader(http.StatusNoContent)
-	case r.Method == "GET":
-		if v, ok := h.store.Lookup(key); ok {
-			w.Write([]byte(v))
-		} else {
-			http.Error(w, "Failed to GET", http.StatusNotFound)
-		}
-	case r.Method == "POST":
-		url, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			log.Printf("Failed to read on POST (%v)\n", err)
-			http.Error(w, "Failed on POST", http.StatusBadRequest)
-			return
-		}
-
-		nodeId, err := strconv.ParseUint(key[1:], 0, 64)
-		if err != nil {
-			log.Printf("Failed to convert ID for conf change (%v)\n", err)
-			http.Error(w, "Failed on POST", http.StatusBadRequest)
-			return
-		}
-
-		cc := raftpb.ConfChange{
-			Type:    raftpb.ConfChangeAddNode,
-			NodeID:  nodeId,
-			Context: url,
-		}
-		h.confChangeC <- cc
-
-		// As above, optimistic that raft will apply the conf change
-		w.WriteHeader(http.StatusNoContent)
-	case r.Method == "DELETE":
-		nodeId, err := strconv.ParseUint(key[1:], 0, 64)
-		if err != nil {
-			log.Printf("Failed to convert ID for conf change (%v)\n", err)
-			http.Error(w, "Failed on DELETE", http.StatusBadRequest)
-			return
-		}
-
-		cc := raftpb.ConfChange{
-			Type:   raftpb.ConfChangeRemoveNode,
-			NodeID: nodeId,
-		}
-		h.confChangeC <- cc
-
-		// As above, optimistic that raft will apply the conf change
-		w.WriteHeader(http.StatusNoContent)
-	default:
-		w.Header().Set("Allow", "PUT")
-		w.Header().Add("Allow", "GET")
-		w.Header().Add("Allow", "POST")
-		w.Header().Add("Allow", "DELETE")
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
 type StartRaftParam struct {
 	Peers []Peer `json: "peers"`
 	Self  Peer   `json: "self"`
 }
 
 // serveHttpKVAPI starts a key-value server with a GET/PUT API and listens.
-func serveHttpKVAPI(router *mux.Router, kv *kvstore, port int) {
+func serveHttpKVAPI(router *mux.Router, kvStore *kvstore, port int) {
 	srv := http.Server{
 		Addr:    ":" + strconv.Itoa(port),
 		Handler: router,
 	}
 	// get key
-	router.HandleFunc("/key/{key}", func(w http.ResponseWriter, r *http.Request) {
+	router.HandleFunc("/keys/{key}", func(w http.ResponseWriter, r *http.Request) {
 		key := mux.Vars(r)["key"]
-		if v, ok := kv.Lookup(key); ok {
+		if v, ok := kvStore.Lookup(key); ok {
 			w.Write([]byte(v))
 		} else {
 			http.Error(w, "Failed to GET", http.StatusNotFound)
 		}
 	}).Methods(http.MethodGet)
 	// put key
-	router.HandleFunc("/key/{key}", func(w http.ResponseWriter, r *http.Request) {
-		key := mux.Vars(r)["key"]
+	router.HandleFunc("/keys", func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		v, err := ioutil.ReadAll(r.Body)
 		if err != nil {
 			log.Printf("Failed to read on PUT (%v)\n", err)
 			http.Error(w, "Failed on PUT", http.StatusBadRequest)
 			return
 		}
-		kv.Propose(key, string(v))
-
+		m := new(map[string]string)
+		if err := json.Unmarshal(v, m); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(*m) == 0 {
+			w.Write([]byte("success"))
+			return
+		}
+		kvs := make([]kv, 0)
+		for k, v := range *m {
+			kvs = append(kvs, kv{Key: k, Val: v})
+		}
+		if err := kvStore.Propose(kvs); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 		// Optimistic-- no waiting for ack from raft. Value is not yet
 		// committed so a subsequent GET on the key may return old value
 		w.Write([]byte("success"))
+		fmt.Printf("request elapse %d \n", time.Now().Sub(start).Nanoseconds()/1000/1000)
 	}).Methods(http.MethodPost)
-
-	//router.Handle("/**", &httpKVAPI{
-	//	store:       kv,
-	//	confChangeC: confChangeC,
-	//	raftNode:    rc,
-	//})
 
 	go func() {
 		if err := srv.ListenAndServe(); err != nil {
@@ -156,7 +95,7 @@ func serveHttpKVAPI(router *mux.Router, kv *kvstore, port int) {
 }
 
 // serveMembersHttpKVAPI manage the raft node
-func serveMembersHttpKVAPI(router *mux.Router, port int,  confChangeC chan<- raftpb.ConfChange, rc *raftNode) {
+func serveMembersHttpKVAPI(router *mux.Router, port int, confChangeC chan<- raftpb.ConfChange, rc *raftNode) {
 	srv := http.Server{
 		Addr:    ":" + strconv.Itoa(port),
 		Handler: router,

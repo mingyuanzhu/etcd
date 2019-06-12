@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestDecodePeer(t *testing.T)  {
+func TestDecodePeer(t *testing.T) {
 	input := "[{\"id\": 100, \"addr\": \"http://localhost:12379\"}, {\"id\": 200, \"addr\": \"http://localhost:22379\"}]"
 	peers := new([]Peer)
 	err := json.Unmarshal([]byte(input), peers)

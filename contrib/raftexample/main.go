@@ -17,6 +17,7 @@ package main
 import (
 	"flag"
 	"github.com/gorilla/mux"
+	"go.etcd.io/etcd/pkg/wait"
 	"log"
 	"strconv"
 	"strings"
@@ -33,7 +34,9 @@ func main() {
 	flag.Parse()
 
 	proposeC := make(chan string)
+	proposeReqC := make(chan Request)
 	defer close(proposeC)
+	defer close(proposeReqC)
 	confChangeC := make(chan raftpb.ConfChange)
 	defer close(confChangeC)
 
@@ -65,14 +68,16 @@ func main() {
 	if peer.Addr == "" {
 		log.Fatalf("can not find local Addr from cluster by ID %d \n", *localID)
 	}
+	// to handle the async request
+	wait := wait.New()
 
-	rc, commitC, errorC, snapshotterReady := newRaftNode(peer, peers, *join, getSnapshot, proposeC, confChangeC)
+	rc, commitC, errorC, snapshotterReady := newRaftNode(peer, peers, *join, getSnapshot, proposeReqC, confChangeC, wait)
 	log.Println("start node successfully")
 	router := mux.NewRouter()
 	serveMembersHttpKVAPI(router, *kvport+1, confChangeC, rc)
 	log.Println("start member server successfully")
 
-	kvs = newKVStore(<-snapshotterReady, proposeC, commitC, errorC)
+	kvs = newKVStore(<-snapshotterReady, proposeReqC, commitC, errorC, wait)
 	// the key-value http handler will propose updates to raft
 	serveHttpKVAPI(router, kvs, *kvport)
 	log.Println("start kvstore successfully")

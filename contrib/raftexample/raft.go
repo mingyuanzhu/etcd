@@ -15,11 +15,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"github.com/pkg/errors"
+	"go.etcd.io/etcd/pkg/wait"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -52,9 +55,9 @@ func (p Peer) String() string {
 
 // A key-value stream backed by raft
 type raftNode struct {
-	proposeC    <-chan string          // proposed messages (k,v)
+	proposeC    <-chan Request         // proposed messages (k,v)
 	confChangeC chan raftpb.ConfChange // proposed cluster config changes
-	commitC     chan<- *string         // entries committed to log (k,v)
+	commitC     chan<- *Request        // entries committed to log (k,v)
 	errorC      chan<- error           // errors from raft session
 
 	peer        Peer   // client ID for raft session
@@ -81,19 +84,21 @@ type raftNode struct {
 	stopc     chan struct{} // signals proposal channel closed
 	httpstopc chan struct{} // signals http server to shutdown
 	httpdonec chan struct{} // signals http server shutdown complete
+
+	wait wait.Wait
 }
 
-var defaultSnapshotCount uint64 = 10
+var defaultSnapshotCount uint64 = 10000
 
 // newRaftNode initiates a raft instance and returns a committed log entry
 // channel and error channel. Proposals for log updates are sent over the
 // provided the proposal channel. All log entries are replayed over the
 // commit channel, followed by a nil message (to indicate the channel is
 // current), then new log entries. To shutdown, close proposeC and read errorC.
-func newRaftNode(peer Peer, peers []Peer, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
-	confChangeC chan raftpb.ConfChange) (*raftNode, <-chan *string, <-chan error, <-chan *snap.Snapshotter) {
+func newRaftNode(peer Peer, peers []Peer, join bool, getSnapshot func() ([]byte, error), proposeC <-chan Request,
+	confChangeC chan raftpb.ConfChange, wait wait.Wait) (*raftNode, <-chan *Request, <-chan error, <-chan *snap.Snapshotter) {
 
-	commitC := make(chan *string)
+	commitC := make(chan *Request)
 	errorC := make(chan error)
 
 	hash := md5.New()
@@ -118,6 +123,8 @@ func newRaftNode(peer Peer, peers []Peer, join bool, getSnapshot func() ([]byte,
 
 		snapshotterReady: make(chan *snap.Snapshotter, 1),
 		// rest of structure populated after WAL replay
+
+		wait: wait,
 	}
 
 	if recordPeers, err := rc.getRecordPeers(); err != nil {
@@ -177,9 +184,13 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 				// ignore empty messages
 				break
 			}
-			s := string(ents[i].Data)
+			var req *Request
+			dec := gob.NewDecoder(bytes.NewBuffer(ents[i].Data))
+			if err := dec.Decode(&req); err != nil {
+				log.Println("raftexample: could not decode message, ", err)
+			}
 			select {
-			case rc.commitC <- &s:
+			case rc.commitC <- req:
 			case <-rc.stopc:
 				return false
 			}
@@ -304,8 +315,6 @@ func (rc *raftNode) StartRaftBySpecialPeers(ctx context.Context, peers []Peer, p
 }
 
 func (rc *raftNode) startRaft() {
-
-
 	if !fileutil.Exist(rc.snapdir) {
 		if err := os.Mkdir(rc.snapdir, 0750); err != nil {
 			log.Fatalf("raftexample: cannot create dir for snapshot (%v)", err)
@@ -404,7 +413,7 @@ func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
 	rc.commitC <- nil // trigger kvstore to load snapshot
 }
 
-var snapshotCatchUpEntriesN uint64 = 10
+var snapshotCatchUpEntriesN uint64 = 10000
 
 func (rc *raftNode) maybeTriggerSnapshot() {
 	if rc.getSnapshot == nil {
@@ -449,8 +458,8 @@ func (rc *raftNode) serveChannels() {
 	rc.appliedIndex = snap.Metadata.Index
 
 	defer rc.wal.Close()
-
-	ticker := time.NewTicker(100 * time.Millisecond)
+	// TODO: tick
+	ticker := time.NewTicker(1000 * time.Millisecond)
 	defer ticker.Stop()
 
 	// send proposals over raft
@@ -463,8 +472,18 @@ func (rc *raftNode) serveChannels() {
 				if !ok {
 					rc.proposeC = nil
 				} else {
-					// blocks until accepted by raft state machine
-					rc.node.Propose(context.TODO(), []byte(prop))
+					var buf bytes.Buffer
+					if err := gob.NewEncoder(&buf).Encode(prop); err != nil {
+						log.Println("encode prop err", err)
+						rc.wait.Trigger(prop.Id, err)
+					} else {
+						// blocks until accepted by raft state machine
+						err := rc.node.Propose(context.TODO(), buf.Bytes())
+						if err != nil {
+							rc.wait.Trigger(prop.Id, err)
+							log.Printf("propose error")
+						}
+					}
 				}
 
 			case cc, ok := <-rc.confChangeC:
@@ -486,7 +505,6 @@ func (rc *raftNode) serveChannels() {
 		select {
 		case <-ticker.C:
 			rc.node.Tick()
-
 		// store raft entries to wal, then publish over commit channel
 		case rd := <-rc.node.Ready():
 			rc.wal.Save(rd.HardState, rd.Entries)
@@ -593,7 +611,6 @@ func (rc *raftNode) UpdatePeers(ctx context.Context, peers *[]Peer) error {
 	return nil
 }
 
-
 func (rc *raftNode) recordPeers(peers []Peer) error {
 	oldwal := wal.Exist(rc.waldir)
 	if !oldwal {
@@ -609,7 +626,6 @@ func (rc *raftNode) recordPeers(peers []Peer) error {
 	err = ioutil.WriteFile(fmt.Sprintf("%s/%s", rc.waldir, "peers.json"), data, 0750)
 	return err
 }
-
 
 func (rc *raftNode) getRecordPeers() ([]Peer, error) {
 	oldwal := wal.Exist(rc.waldir)

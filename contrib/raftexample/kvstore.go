@@ -15,21 +15,45 @@
 package main
 
 import (
-	"bytes"
-	"encoding/gob"
 	"encoding/json"
+	"github.com/pkg/errors"
+	"go.etcd.io/etcd/pkg/wait"
 	"log"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"go.etcd.io/etcd/etcdserver/api/snap"
 )
 
 // a key-value store backed by raft
 type kvstore struct {
-	proposeC    chan<- string // channel for proposing updates
+	proposeC    chan<- Request // channel for proposing updates
 	mu          sync.RWMutex
 	kvStore     map[string]string // current committed key-value pairs
 	snapshotter *snap.Snapshotter
+	idWorker    *IDWorker
+	wait        wait.Wait
+}
+
+type IDWorker struct {
+	index *uint64
+}
+
+func NewIDWorker() *IDWorker {
+	var index uint64
+	return &IDWorker{
+		index: &index,
+	}
+}
+
+func (w *IDWorker) getID() uint64 {
+	return atomic.AddUint64(w.index, 1)
+}
+
+type Request struct {
+	Id   uint64
+	Data []kv
 }
 
 type kv struct {
@@ -37,8 +61,9 @@ type kv struct {
 	Val string
 }
 
-func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *string, errorC <-chan error) *kvstore {
-	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
+func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- Request, commitC <-chan *Request, errorC <-chan error, wait wait.Wait) *kvstore {
+	idWorker := NewIDWorker()
+	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter, idWorker: idWorker, wait: wait}
 	// read commits from raft into kvStore map until error
 	go s.readCommits(commitC, errorC)
 	return s
@@ -51,17 +76,30 @@ func (s *kvstore) Lookup(key string) (string, bool) {
 	return v, ok
 }
 
-func (s *kvstore) Propose(k string, v string) {
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(kv{k, v}); err != nil {
-		log.Fatal(err)
+func (s *kvstore) Propose(kvs []kv) error {
+
+	id := s.idWorker.getID()
+	request := Request{
+		Id:   id,
+		Data: kvs,
 	}
-	s.proposeC <- buf.String()
+	ch := s.wait.Register(id)
+	s.proposeC <- request
+	select {
+	case resp := <-ch:
+		if resp != nil {
+			return resp.(error)
+		}
+		return nil
+	case <-time.After(time.Second * 3):
+		s.wait.Trigger(id, nil)
+		return errors.New("timeout")
+	}
 }
 
-func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
-	for data := range commitC {
-		if data == nil {
+func (s *kvstore) readCommits(commitC <-chan *Request, errorC <-chan error) {
+	for req := range commitC {
+		if req == nil {
 			// done replaying log; new data incoming
 			// OR signaled to load snapshot
 			snapshot, err := s.snapshotter.Load()
@@ -78,16 +116,13 @@ func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
 			continue
 		}
 
-		log.Printf("read commit data %s \n", *data)
-
-		var dataKv kv
-		dec := gob.NewDecoder(bytes.NewBufferString(*data))
-		if err := dec.Decode(&dataKv); err != nil {
-			log.Fatalf("raftexample: could not decode message (%v)", err)
-		}
 		s.mu.Lock()
-		s.kvStore[dataKv.Key] = dataKv.Val
+		for _, kv := range req.Data {
+			s.kvStore[kv.Key] = kv.Val
+		}
 		s.mu.Unlock()
+		s.wait.Trigger(req.Id, nil)
+
 	}
 	if err, ok := <-errorC; ok {
 		log.Fatal(err)
