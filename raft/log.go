@@ -368,3 +368,7 @@ func (l *raftLog) zeroTermOnErrCompacted(t uint64, err error) uint64 {
 	l.logger.Panicf("unexpected error (%v)", err)
 	return 0
 }
+
+func (l *raftLog) isContainsConf(lo, hi uint64) (bool, error) {
+	return l.storage.ContainsConf(lo, hi)
+}

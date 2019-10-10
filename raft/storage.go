@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"math"
 	"sync"
 
 	pb "go.etcd.io/etcd/raft/raftpb"
@@ -67,6 +68,8 @@ type Storage interface {
 	// so raft state machine could know that Storage needs some time to prepare
 	// snapshot and call Snapshot later.
 	Snapshot() (pb.Snapshot, error)
+	// Check the entries which are between the lo and hi whether contain the Conf entries
+	ContainsConf(lo, hi uint64) (bool, error)
 }
 
 // MemoryStorage implements the Storage interface backed by an
@@ -268,4 +271,15 @@ func (ms *MemoryStorage) Append(entries []pb.Entry) error {
 			ms.lastIndex(), entries[0].Index)
 	}
 	return nil
+}
+
+func (ms *MemoryStorage) ContainsConf(lo, hi uint64) (bool, error) {
+	entries, err := ms.Entries(lo, hi, math.MaxUint64);
+	if err != nil {
+		return false, err
+	}
+	if numOfPendingConf(entries) > 0 {
+		return true, nil
+	}
+	return false, nil
 }
